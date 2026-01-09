@@ -48,14 +48,15 @@ F6ZHAZMKSLY7ISFO
 
 By default, we defined secret code length to *16* char long. You can change it if you need to generate long code. Accepted values should be in integer and within range of 16 to 128.
 
-eg: now we want to generate a 32 char long secret code. `Mfa::setSecretCodeLength(32)->createSecretCode();`
+eg: now we want to generate a 32 char long secret code. `Mfa::setSecretCodeLength(32);` then `Mfa::createSecretCode();`
 
 ```php
 <?php
 
 use Nishadil\Mfa\Mfa;
 
-echo Mfa::setSecretCodeLength(32)->createSecretCode();
+Mfa::setSecretCodeLength(32);
+echo Mfa::createSecretCode();
 
 ?>
 ```
