@@ -47,20 +47,26 @@ class Mfa
 
     public static function getTOTP(string $secretCode, int $timeStep = null): string
     {
-        $timeStep = $timeStep ?? self::$mfa_secretCodeTime;
-        return self::generateOTP($secretCode, (int) floor(time() / $timeStep));
+        $timeStep = self::normalizeTimeStep($timeStep);
+        if ($timeStep === null) {
+            return '';
+        }
+
+        $otp = self::generateOTP($secretCode, (int) floor(time() / $timeStep));
+        return $otp ?? '';
     }
 
     public static function getHOTP(string $secretCode, int $counter): string
     {
-        return self::generateOTP($secretCode, $counter);
+        $otp = self::generateOTP($secretCode, $counter);
+        return $otp ?? '';
     }
 
-    private static function generateOTP(string $secretCode, int $value): string
+    private static function generateOTP(string $secretCode, int $value): ?string
     {
         $secretCode_decoded = self::decodeSecretCode($secretCode);
         if ($secretCode_decoded === null) {
-            return '';
+            return null;
         }
 
         $counterBytes = pack('N*', 0, $value);
@@ -74,10 +80,26 @@ class Mfa
 
     public static function validateTOTP(string $secretCode, string $userProvided_otp, int $tolerance = 1): bool
     {
-        $currentTimeSlice = (int) floor(time() / self::$mfa_secretCodeTime);
+        if (!self::isValidOtpFormat($userProvided_otp)) {
+            return false;
+        }
+
+        $timeStep = self::normalizeTimeStep(null);
+        if ($timeStep === null) {
+            return false;
+        }
+
+        if ($tolerance < 0) {
+            return false;
+        }
+
+        $currentTimeSlice = (int) floor(time() / $timeStep);
 
         for ($i = -$tolerance; $i <= $tolerance; $i++) {
             $generatedCode = self::generateOTP($secretCode, $currentTimeSlice + $i);
+            if ($generatedCode === null) {
+                return false;
+            }
             if (hash_equals($generatedCode, $userProvided_otp)) {
                 return true;
             }
@@ -87,7 +109,14 @@ class Mfa
 
     public static function validateHOTP(string $secretCode, string $userProvided_otp, int $counter): bool
     {
-        $generatedCode = self::getHOTP($secretCode, $counter);
+        if (!self::isValidOtpFormat($userProvided_otp)) {
+            return false;
+        }
+
+        $generatedCode = self::generateOTP($secretCode, $counter);
+        if ($generatedCode === null) {
+            return false;
+        }
         return hash_equals($generatedCode, $userProvided_otp);
     }
 
@@ -116,13 +145,18 @@ class Mfa
         self::$mfa_algorithm = $algorithm;
     }
 
-    public static function generateOtpAuthUri(string $secretCode, string $accountName, string $issuer = 'MyApp', string $type = 'totp',int $counter = 0): string {
+    public static function generateOtpAuthUri(string $secretCode, string $accountName, string $issuer = 'MyApp', string $type = 'totp', int $counter = 0): string
+    {
         $secret = strtoupper($secretCode);
         $algorithm = strtoupper(self::$mfa_algorithm);
+        $type = strtolower($type);
+        if (!in_array($type, ['totp', 'hotp'], true)) {
+            $type = 'totp';
+        }
 
         $baseUri = sprintf(
             "otpauth://%s/%s:%s?secret=%s&issuer=%s&digits=%d&algorithm=%s",
-            strtolower($type),
+            $type,
             rawurlencode($issuer),
             rawurlencode($accountName),
             $secret,
@@ -134,7 +168,7 @@ class Mfa
         if ($type === 'totp') {
             $baseUri .= "&period=" . self::$mfa_secretCodeTime;
         } elseif ($type === 'hotp') {
-            $baseUri .= "&counter=" . $counter;
+            $baseUri .= "&counter=" . max(0, $counter);
         }
 
         return $baseUri;
@@ -170,17 +204,21 @@ class Mfa
         $base32LookupTable = self::base32LookupTable();
         $base32LookupTable_flip = array_flip($base32LookupTable);
 
+        $length = strlen($secretCode);
         $subStrCount = substr_count($secretCode, $base32LookupTable[32]);
-
-        if (!in_array($subStrCount, self::$mfa_decodeSecretCodeValidValues, true)) {
-            return null;
-        }
-
-        for ($i = 0; $i < 4; ++$i) {
-            if (
-                $subStrCount == self::$mfa_decodeSecretCodeValidValues[$i] &&
-                substr($secretCode, -(self::$mfa_decodeSecretCodeValidValues[$i])) != str_repeat($base32LookupTable[32], self::$mfa_decodeSecretCodeValidValues[$i])
-            ) {
+        if ($subStrCount > 0) {
+            if (!in_array($subStrCount, self::$mfa_decodeSecretCodeValidValues, true)) {
+                return null;
+            }
+            if ($length % 8 !== 0) {
+                return null;
+            }
+            if (substr($secretCode, -$subStrCount) !== str_repeat($base32LookupTable[32], $subStrCount)) {
+                return null;
+            }
+        } else {
+            $remainder = $length % 8;
+            if (!in_array($remainder, [0, 2, 4, 5, 7], true)) {
                 return null;
             }
         }
@@ -188,29 +226,50 @@ class Mfa
         $secretCode = str_split(str_replace('=', '', $secretCode));
 
         $secretCode_decoded = '';
-        for ($i = 0; $i < count($secretCode); $i = $i + 8) {
-            $x = '';
-
-            if (!in_array($secretCode[$i], $base32LookupTable, true)) {
+        $buffer = 0;
+        $bufferSize = 0;
+        for ($i = 0; $i < count($secretCode); ++$i) {
+            $char = $secretCode[$i];
+            if (!isset($base32LookupTable_flip[$char])) {
                 return null;
             }
 
-            for ($n = 0; $n < 8; ++$n) {
-                $val = $base32LookupTable_flip[$secretCode[$i + $n]] ?? null;
-                if ($val === null) {
-                    continue;
-                }
-                $x .= str_pad(base_convert((string) $val, 10, 2), 5, '0', STR_PAD_LEFT);
+            $val = $base32LookupTable_flip[$char];
+            if ($val === 32) {
+                return null;
             }
 
-            $mfa_eightBits = str_split($x, 8);
-            for ($d = 0; $d < count($mfa_eightBits); ++$d) {
-                $intVal = (int) base_convert($mfa_eightBits[$d], 2, 10);
-                $secretCode_decoded .= chr($intVal);
+            $buffer = ($buffer << 5) | $val;
+            $bufferSize += 5;
+
+            while ($bufferSize >= 8) {
+                $bufferSize -= 8;
+                $byte = ($buffer >> $bufferSize) & 0xFF;
+                $secretCode_decoded .= chr($byte);
+                if ($bufferSize > 0) {
+                    $buffer = $buffer & ((1 << $bufferSize) - 1);
+                } else {
+                    $buffer = 0;
+                }
             }
         }
 
         return $secretCode_decoded;
+    }
+
+    private static function normalizeTimeStep(?int $timeStep): ?int
+    {
+        $timeStep = $timeStep ?? self::$mfa_secretCodeTime;
+        if ($timeStep === null || $timeStep <= 0) {
+            return null;
+        }
+
+        return $timeStep;
+    }
+
+    private static function isValidOtpFormat(string $otp): bool
+    {
+        return $otp !== '' && strlen($otp) === self::$mfa_TOTPLength && ctype_digit($otp);
     }
 
     private static function base32LookupTable(): array
